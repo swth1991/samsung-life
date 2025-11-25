@@ -1,12 +1,10 @@
 """
 DB Access Analyzer 모듈
 
-설정 파일의 테이블 및 칼럼 정보와 XML/Java 파일에서 추출한 SQL 쿼리를 비교하여,
-특정 테이블에 접근하는 파일을 필터링하고 태그를 부여하는 DB Access Analyzer를 구현합니다.
+config.json에 설정된 DB 테이블과 칼럼에 접근하는 소스 파일 목록을 작성합니다.
 """
 
 import logging
-import re
 from pathlib import Path
 from typing import List, Dict, Set, Optional, Any
 from collections import defaultdict
@@ -24,18 +22,8 @@ class DBAccessAnalyzer:
     """
     DB Access Analyzer 클래스
     
-    XML Mapper Parser와 Java AST Parser 결과를 통합하여
-    테이블 접근 파일을 식별하고 태그를 부여합니다.
+    config.json에 설정된 DB 테이블과 칼럼에 접근하는 소스 파일을 식별합니다.
     """
-    
-    # 레이어 분류 패턴
-    LAYER_PATTERNS = {
-        "Mapper": [r".*Mapper\.xml$", r".*\.xml$"],
-        "DTO": [r".*DTO\.java$", r".*Dto\.java$", r".*dto\.java$"],
-        "DAO": [r".*DAO\.java$", r".*Dao\.java$", r".*dao\.java$"],
-        "Service": [r".*Service\.java$", r".*service\.java$"],
-        "Controller": [r".*Controller\.java$", r".*controller\.java$"]
-    }
     
     def __init__(
         self,
@@ -69,10 +57,12 @@ class DBAccessAnalyzer:
         self.access_tables = config_manager.get("access_tables", [])
         if not self.access_tables:
             self.access_tables = config_manager.access_tables
+        
+        # 테이블별 칼럼 매핑 생성 (대소문자 무시)
         self.table_column_map: Dict[str, Set[str]] = {}
         for table_info in self.access_tables:
-            table_name = table_info.get("table_name", "").upper()
-            columns = {col.upper() for col in table_info.get("columns", [])}
+            table_name = table_info.get("table_name", "").lower()
+            columns = {col.lower() for col in table_info.get("columns", [])}
             self.table_column_map[table_name] = columns
     
     def analyze(
@@ -88,56 +78,71 @@ class DBAccessAnalyzer:
         Returns:
             List[TableAccessInfo]: 테이블 접근 정보 목록
         """
-        # 파일-테이블 매핑 생성
-        file_table_map = self._identify_table_access_files(source_files)
+        # ClassInfo 목록 수집 (CallGraphBuilder에서 재사용)
+        class_info_map = self._collect_class_info_map(source_files)
         
-        # 파일 태그 부여
-        tagged_files = self._assign_file_tags(source_files, file_table_map)
+        # config.json에 설정된 각 DB 테이블에 대해 분석
+        table_access_info_list = []
         
-        # 레이어별 파일 분류
-        layer_files = self._classify_files_by_layer(tagged_files)
-        
-        # 칼럼 레벨 분석
-        table_access_info_list = self._analyze_column_level(file_table_map, layer_files)
-        
-        # 의존성 추적
-        if self.call_graph_builder:
-            self._track_dependencies(table_access_info_list, layer_files)
+        for table_config in self.access_tables:
+            table_name = table_config.get("table_name", "").lower()
+            columns = {col.lower() for col in table_config.get("columns", [])}
+            
+            if not table_name:
+                continue
+            
+            # 테이블별 접근 정보 수집
+            table_info = self._analyze_table_access(
+                table_name,
+                columns,
+                source_files,
+                class_info_map
+            )
+            
+            if table_info:
+                table_access_info_list.append(table_info)
         
         return table_access_info_list
     
-    def _identify_table_access_files(
+    def _collect_class_info_map(
         self,
         source_files: List[SourceFile]
-    ) -> Dict[str, Set[str]]:
+    ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        XML Mapper Parser와 Java AST Parser 결과를 통합하여 테이블 접근 파일 식별
+        ClassInfo 목록을 수집하여 클래스명 -> 파일 경로 매핑 생성
         
         Args:
             source_files: 소스 파일 목록
             
         Returns:
-            Dict[str, Set[str]]: 테이블명 -> 파일 경로 집합 매핑
+            Dict[str, List[Dict[str, Any]]]: 클래스명 -> ClassInfo 리스트 매핑
         """
-        file_table_map: Dict[str, Set[str]] = defaultdict(set)
-        
-        # Java 파일을 클래스명으로 매핑 (클래스 선언 파일 찾기용)
-        class_to_files: Dict[str, Set[str]] = defaultdict(set)
-        java_files = [f for f in source_files if f.extension == ".java"]
+        class_info_map: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         
         # CallGraphBuilder에서 이미 파싱된 클래스 정보 재사용
         if self.call_graph_builder and self.call_graph_builder.file_to_classes_map:
-            # 이미 파싱된 정보 사용
             for file_path_str, classes in self.call_graph_builder.file_to_classes_map.items():
                 for cls in classes:
-                    # 클래스명 -> 파일 경로 매핑
-                    class_to_files[cls.name].add(file_path_str)
-                    # 패키지 포함 전체 클래스명도 매핑
+                    # 클래스명 (단순 이름)
+                    class_info_map[cls.name].append({
+                        "class_name": cls.name,
+                        "package": cls.package,
+                        "full_class_name": f"{cls.package}.{cls.name}" if cls.package else cls.name,
+                        "file_path": file_path_str
+                    })
+                    
+                    # 패키지 포함 전체 클래스명
                     if cls.package:
                         full_class_name = f"{cls.package}.{cls.name}"
-                        class_to_files[full_class_name].add(file_path_str)
+                        class_info_map[full_class_name].append({
+                            "class_name": cls.name,
+                            "package": cls.package,
+                            "full_class_name": full_class_name,
+                            "file_path": file_path_str
+                        })
         else:
-            # CallGraphBuilder가 없거나 파싱되지 않은 경우에만 직접 파싱
+            # CallGraphBuilder가 없으면 직접 파싱
+            java_files = [f for f in source_files if f.extension == ".java"]
             for java_file in java_files:
                 try:
                     tree, error = self.java_parser.parse_file(java_file.path)
@@ -146,594 +151,351 @@ class DBAccessAnalyzer:
                     
                     classes = self.java_parser.extract_class_info(tree, java_file.path)
                     for cls in classes:
-                        # 클래스명 -> 파일 경로 매핑
-                        class_to_files[cls.name].add(str(java_file.path))
-                        # 패키지 포함 전체 클래스명도 매핑
+                        class_info_map[cls.name].append({
+                            "class_name": cls.name,
+                            "package": cls.package,
+                            "full_class_name": f"{cls.package}.{cls.name}" if cls.package else cls.name,
+                            "file_path": str(java_file.path)
+                        })
+                        
                         if cls.package:
                             full_class_name = f"{cls.package}.{cls.name}"
-                            class_to_files[full_class_name].add(str(java_file.path))
+                            class_info_map[full_class_name].append({
+                                "class_name": cls.name,
+                                "package": cls.package,
+                                "full_class_name": full_class_name,
+                                "file_path": str(java_file.path)
+                            })
                 except Exception as e:
                     self.logger.debug(f"Java 파일 파싱 중 오류 (무시): {java_file.path} - {e}")
         
-        # XML 파일 분석
+        return dict(class_info_map)
+    
+    def _analyze_table_access(
+        self,
+        table_name: str,
+        columns: Set[str],
+        source_files: List[SourceFile],
+        class_info_map: Dict[str, List[Dict[str, Any]]]
+    ) -> Optional[TableAccessInfo]:
+        """
+        특정 테이블에 대한 접근 정보 분석
+        
+        Args:
+            table_name: 테이블명
+            columns: 칼럼 목록
+            source_files: 소스 파일 목록
+            class_info_map: 클래스 정보 매핑
+            
+        Returns:
+            Optional[TableAccessInfo]: 테이블 접근 정보
+        """
+        # XML 파일 목록
         xml_files = [f for f in source_files if f.extension == ".xml"]
+        
+        # 수집된 정보
+        sql_queries: List[Dict[str, Any]] = []
+        interface_files: Set[str] = set()
+        dao_files: Set[str] = set()
+        layer_files: Dict[str, Set[str]] = defaultdict(set)  # layer -> file_paths
+        all_added_files: Set[str] = set()  # 모든 레이어에 추가된 파일 추적 (중복 방지용)
+        
+        # 각 XML 파일에 대해 분석
         for xml_file in xml_files:
             try:
                 result = self.xml_parser.parse_mapper_file(xml_file.path)
                 if result.get("error"):
-                    self.logger.warning(f"XML 파일 파싱 실패: {xml_file.path} - {result['error']}")
                     continue
                 
-                # SQL 쿼리에서 테이블명 추출
-                for sql_query_info in result.get("sql_queries", []):
-                    sql = sql_query_info.get("sql", "")
-                    if sql:
-                        tables = self.sql_strategy.extract_table_names(sql)
-                        for table in tables:
-                            file_table_map[str(xml_file.path)].add(table)
+                # SQL 쿼리 중 설정된 테이블의 칼럼을 사용하는 쿼리 수집
+                matching_queries = self._find_matching_sql_queries(
+                    result.get("sql_queries", []),
+                    table_name,
+                    columns
+                )
                 
-                # XML에서 class 정보 추출 (resultType, parameterType, resultMap)
-                xml_classes = self._extract_classes_from_xml(result, xml_file.path)
+                if not matching_queries:
+                    continue
                 
-                # 추출된 class들을 선언하거나 사용하는 Java 파일 찾기
-                related_java_files = set()
-                for class_name in xml_classes:
-                    # 클래스명으로 파일 찾기
-                    if class_name in class_to_files:
-                        related_java_files.update(class_to_files[class_name])
-                    # 패키지명 제거한 클래스명으로도 찾기
-                    simple_class_name = class_name.split('.')[-1]
-                    if simple_class_name in class_to_files:
-                        related_java_files.update(class_to_files[simple_class_name])
-                
-                # Mapper interface 찾기 및 Call Graph를 통한 관련 파일 찾기
-                mapper_interface_files = self._find_mapper_interfaces(related_java_files, source_files)
-                related_java_files.update(mapper_interface_files)
-                
-                # Call Graph를 사용하여 Mapper interface를 사용하는 파일 찾기
-                if self.call_graph_builder and self.call_graph_builder.call_graph:
-                    dependent_files = self._find_files_using_mapper_interfaces(
-                        mapper_interface_files, 
-                        source_files
-                    )
-                    related_java_files.update(dependent_files)
-                
-                # 관련 Java 파일들을 테이블 접근 파일에 추가 (중복 제거됨)
-                for sql_query_info in result.get("sql_queries", []):
-                    sql = sql_query_info.get("sql", "")
-                    if sql:
-                        tables = self.sql_strategy.extract_table_names(sql)
-                        for table in tables:
-                            for java_file_path in related_java_files:
-                                # 파일 경로를 문자열로 변환하여 일관성 유지
-                                file_table_map[str(java_file_path)].add(table)
-                
+                # 각 SQL 쿼리에 대해 처리
+                for sql_query_info in matching_queries:
+                    sql_queries.append(sql_query_info)
+                    
+                    # 5. namespace의 full class 추출 → interface 파일 목록에 추가
+                    namespace = sql_query_info.get("namespace", "")
+                    if namespace:
+                        interface_file = self._find_class_file(namespace, class_info_map)
+                        if interface_file and interface_file not in all_added_files:
+                            interface_files.add(interface_file)
+                            layer_files["interface"].add(interface_file)
+                            all_added_files.add(interface_file)
+                    
+                    # 6. result_type의 full class 추출 → dao 파일 목록에 추가
+                    result_type = sql_query_info.get("result_type")
+                    if result_type:
+                        dao_file = self._find_class_file(result_type, class_info_map)
+                        if dao_file and dao_file not in all_added_files:
+                            dao_files.add(dao_file)
+                            layer_files["dao"].add(dao_file)
+                            all_added_files.add(dao_file)
+                    
+                    # 7. namespace의 class_name + sql query의 id로 method string 조합
+                    method_string = self._build_method_string(namespace, sql_query_info.get("id", ""))
+                    
+                    if method_string and self.call_graph_builder and self.call_graph_builder.call_graph:
+                        # 8-9. Call Graph에서 역방향으로 탐색하여 상위 layer 파일 찾기
+                        upper_layer_files = self._find_upper_layer_files(method_string)
+                        for layer, file_path in upper_layer_files:
+                            if layer and file_path and file_path not in all_added_files:
+                                layer_files[layer].add(file_path)
+                                all_added_files.add(file_path)
+            
             except Exception as e:
                 self.logger.error(f"XML 파일 분석 중 오류: {xml_file.path} - {e}")
         
-        # Java 파일 분석 (SQL 쿼리가 포함된 경우)
-        for java_file in java_files:
-            try:
-                # Java 파일에서 SQL 쿼리 추출 (주석, 문자열 리터럴 등)
-                sql_queries = self._extract_sql_from_java(java_file.path)
-                for sql in sql_queries:
-                    tables = self.sql_strategy.extract_table_names(sql)
-                    for table in tables:
-                        file_table_map[str(java_file.path)].add(table)
-            except Exception as e:
-                self.logger.error(f"Java 파일 분석 중 오류: {java_file.path} - {e}")
+        # TableAccessInfo 생성
+        if not sql_queries:
+            return None
         
-        return dict(file_table_map)
+        # 모든 레이어 파일 경로 수집
+        all_access_files = set(interface_files)
+        all_access_files.update(dao_files)
+        for files in layer_files.values():
+            all_access_files.update(files)
+        
+        # 레이어 결정 (가장 많은 파일이 있는 레이어)
+        main_layer = self._determine_main_layer(layer_files)
+        
+        # 칼럼 목록 추출 (SQL 쿼리에서 사용된 칼럼)
+        used_columns = self._extract_used_columns(sql_queries, table_name, columns)
+        
+        # layer_files를 딕셔너리로 변환 (Set -> List)
+        layer_files_dict = {
+            layer: sorted(list(files))
+            for layer, files in layer_files.items()
+        }
+        
+        table_access_info = TableAccessInfo(
+            table_name=table_name,
+            columns=sorted(list(used_columns)),
+            access_files=sorted(list(all_access_files)),
+            query_type=sql_queries[0].get("query_type", "SELECT") if sql_queries else "SELECT",
+            sql_query=sql_queries[0].get("sql", "") if sql_queries else None,
+            layer=main_layer,
+            sql_queries=sql_queries,  # SQL 쿼리 목록 저장
+            layer_files=layer_files_dict  # 레이어별 파일 경로 목록 저장
+        )
+        
+        return table_access_info
     
-    def _extract_sql_from_java(self, file_path: Path) -> List[str]:
+    def _find_matching_sql_queries(
+        self,
+        sql_queries: List[Dict[str, Any]],
+        table_name: str,
+        columns: Set[str]
+    ) -> List[Dict[str, Any]]:
         """
-        Java 파일에서 SQL 쿼리 추출
+        SQL 쿼리 중 설정된 테이블의 칼럼을 사용하는 쿼리 찾기
         
         Args:
-            file_path: Java 파일 경로
+            sql_queries: SQL 쿼리 목록
+            table_name: 테이블명
+            columns: 칼럼 목록
             
         Returns:
-            List[str]: 추출된 SQL 쿼리 목록
+            List[Dict[str, Any]]: 매칭되는 SQL 쿼리 목록
         """
-        sql_queries = []
+        matching_queries = []
         
-        # 여러 인코딩 시도
-        content = None
-        encodings = ['utf-8', 'euc-kr', 'cp949', 'latin-1', 'iso-8859-1']
-        
-        for encoding in encodings:
-            try:
-                content = file_path.read_text(encoding=encoding)
-                break  # 성공하면 루프 종료
-            except UnicodeDecodeError:
-                continue  # 다음 인코딩 시도
-            except Exception as e:
-                # 다른 에러는 마지막 인코딩까지 시도 후 에러 반환
-                if encoding == encodings[-1]:
-                    self.logger.warning(f"Java 파일에서 SQL 추출 실패: {file_path} - {e}")
-                    return sql_queries
-                continue
-        
-        if content is None:
-            self.logger.warning(f"Java 파일에서 SQL 추출 실패: {file_path} - 지원되는 인코딩을 찾을 수 없습니다")
-            return sql_queries
-        
-        try:
-            # 문자열 리터럴에서 SQL 쿼리 추출
-            # "SELECT ..." 또는 'SELECT ...' 형식
-            string_pattern = r'["\']([^"\']*(?:SELECT|INSERT|UPDATE|DELETE)[^"\']*)["\']'
-            matches = re.findall(string_pattern, content, re.IGNORECASE | re.DOTALL)
-            sql_queries.extend(matches)
-            
-            # 주석에서 SQL 쿼리 추출
-            # /* SQL: SELECT ... */ 형식
-            comment_pattern = r'/\*\s*SQL:\s*([^*]+)\s*\*/'
-            comment_matches = re.findall(comment_pattern, content, re.IGNORECASE | re.DOTALL)
-            sql_queries.extend(comment_matches)
-            
-        except Exception as e:
-            self.logger.warning(f"Java 파일에서 SQL 추출 실패: {file_path} - {e}")
-        
-        return sql_queries
-    
-    def _extract_classes_from_xml(
-        self, 
-        xml_result: Dict[str, Any], 
-        xml_file_path: Path
-    ) -> Set[str]:
-        """
-        XML 파싱 결과에서 class 정보 추출 (resultType, parameterType, resultMap)
-        
-        Args:
-            xml_result: XML 파서 결과
-            xml_file_path: XML 파일 경로
-            
-        Returns:
-            Set[str]: 추출된 클래스명 집합
-        """
-        classes = set()
-        
-        # SQL 쿼리에서 resultType, parameterType 추출
-        for sql_query_info in xml_result.get("sql_queries", []):
-            result_type = sql_query_info.get("result_type")
-            parameter_type = sql_query_info.get("parameter_type")
-            
-            if result_type:
-                # 패키지명 포함 전체 클래스명 또는 단순 클래스명
-                classes.add(result_type)
-                # 패키지명 제거한 클래스명도 추가
-                simple_name = result_type.split('.')[-1]
-                if simple_name != result_type:
-                    classes.add(simple_name)
-            
-            if parameter_type:
-                classes.add(parameter_type)
-                simple_name = parameter_type.split('.')[-1]
-                if simple_name != parameter_type:
-                    classes.add(simple_name)
-        
-        # resultMap에서 type 속성 추출 및 mapper namespace 추출
-        try:
-            tree, error = self.xml_parser.parse_file(xml_file_path)
-            if not error:
-                root = tree.getroot()
-                
-                # mapper namespace 추출 (interface 이름으로 사용됨)
-                namespace = root.get('namespace', '')
-                if namespace:
-                    # namespace는 보통 패키지.인터페이스명 형식
-                    classes.add(namespace)
-                    simple_name = namespace.split('.')[-1]
-                    if simple_name != namespace:
-                        classes.add(simple_name)
-                
-                # resultMap 요소 찾기
-                result_maps = root.xpath(".//resultMap")
-                for result_map in result_maps:
-                    type_attr = result_map.get('type')
-                    if type_attr:
-                        classes.add(type_attr)
-                        simple_name = type_attr.split('.')[-1]
-                        if simple_name != type_attr:
-                            classes.add(simple_name)
-                
-                # method element의 parameterType, resultType도 확인
-                # (일부 XML에서는 method 태그를 사용)
-                methods = root.xpath(".//method")
-                for method in methods:
-                    param_type = method.get('parameterType')
-                    result_type = method.get('resultType')
-                    if param_type:
-                        classes.add(param_type)
-                        simple_name = param_type.split('.')[-1]
-                        if simple_name != param_type:
-                            classes.add(simple_name)
-                    if result_type:
-                        classes.add(result_type)
-                        simple_name = result_type.split('.')[-1]
-                        if simple_name != result_type:
-                            classes.add(simple_name)
-        except Exception as e:
-            self.logger.debug(f"XML class 정보 추출 중 오류 (무시): {xml_file_path} - {e}")
-        
-        return classes
-    
-    def _find_mapper_interfaces(
-        self, 
-        java_file_paths: Set[str], 
-        source_files: List[SourceFile]
-    ) -> Set[str]:
-        """
-        Java 파일 중 Mapper interface 찾기
-        
-        Args:
-            java_file_paths: 확인할 Java 파일 경로 집합
-            source_files: 전체 소스 파일 목록
-            
-        Returns:
-            Set[str]: Mapper interface 파일 경로 집합
-        """
-        mapper_files = set()
-        
-        # 파일 경로를 Path로 변환하여 SourceFile 찾기
-        path_to_file = {str(f.path): f for f in source_files}
-        
-        for file_path_str in java_file_paths:
-            if file_path_str not in path_to_file:
+        for sql_query_info in sql_queries:
+            sql = sql_query_info.get("sql", "")
+            if not sql:
                 continue
             
-            java_file = path_to_file[file_path_str]
-            try:
-                # CallGraphBuilder에서 이미 파싱된 클래스 정보 재사용
-                if self.call_graph_builder:
-                    classes = self.call_graph_builder.get_classes_for_file(java_file.path)
-                else:
-                    # CallGraphBuilder가 없으면 직접 파싱
-                    tree, error = self.java_parser.parse_file(java_file.path)
-                    if error:
-                        continue
-                    classes = self.java_parser.extract_class_info(tree, java_file.path)
-                
-                for cls in classes:
-                    # 파일명이나 클래스명에 Mapper가 포함되어 있는지 확인
-                    is_mapper_name = 'Mapper' in cls.name or 'Mapper' in java_file.filename
-                    
-                    if is_mapper_name:
-                        # @Mapper, @Repository 어노테이션 확인
-                        has_mapper_annotation = any(
-                            'Mapper' in ann or 'Repository' in ann 
-                            for ann in cls.annotations
-                        )
-                        
-                        # interface인지 확인: interface는 보통 필드가 없고 메서드만 있음
-                        # 또는 파일 내용에서 "interface" 키워드 확인
-                        is_likely_interface = len(cls.fields) == 0 and len(cls.methods) > 0
-                        
-                        if has_mapper_annotation or (is_mapper_name and is_likely_interface):
-                            mapper_files.add(file_path_str)
-                            self.logger.debug(f"Mapper interface 발견: {file_path_str} (클래스: {cls.name})")
-                            break
-            except Exception as e:
-                self.logger.debug(f"Mapper interface 확인 중 오류 (무시): {file_path_str} - {e}")
+            # 테이블명 확인
+            tables = self.sql_strategy.extract_table_names(sql)
+            if table_name.lower() not in {t.lower() for t in tables}:
+                continue
+            
+            # 칼럼 확인 (하나 이상의 칼럼이 사용되는지)
+            sql_columns = self.sql_strategy.extract_column_names(sql, table_name)
+            sql_columns_lower = {c.lower() for c in sql_columns}
+            
+            # 설정된 칼럼 중 하나 이상이 사용되는지 확인
+            if columns.intersection(sql_columns_lower):
+                matching_queries.append(sql_query_info)
         
-        return mapper_files
+        return matching_queries
     
-    def _find_files_using_mapper_interfaces(
-        self, 
-        mapper_interface_files: Set[str], 
-        source_files: List[SourceFile]
-    ) -> Set[str]:
+    def _find_class_file(
+        self,
+        full_class_name: str,
+        class_info_map: Dict[str, List[Dict[str, Any]]]
+    ) -> Optional[str]:
         """
-        Call Graph를 사용하여 Mapper interface를 사용하는 파일 찾기
+        클래스명으로 파일 경로 찾기
         
         Args:
-            mapper_interface_files: Mapper interface 파일 경로 집합
-            source_files: 전체 소스 파일 목록
+            full_class_name: 전체 클래스명 (패키지 포함)
+            class_info_map: 클래스 정보 매핑
             
         Returns:
-            Set[str]: Mapper interface를 사용하는 파일 경로 집합
+            Optional[str]: 파일 경로
         """
-        dependent_files = set()
+        # 전체 클래스명으로 찾기
+        if full_class_name in class_info_map:
+            class_infos = class_info_map[full_class_name]
+            if class_infos:
+                return class_infos[0]["file_path"]
+        
+        # 단순 클래스명으로 찾기
+        simple_class_name = full_class_name.split('.')[-1]
+        if simple_class_name in class_info_map:
+            class_infos = class_info_map[simple_class_name]
+            # 패키지명이 일치하는 것 우선
+            for class_info in class_infos:
+                if class_info["full_class_name"] == full_class_name:
+                    return class_info["file_path"]
+            # 없으면 첫 번째 것
+            if class_infos:
+                return class_infos[0]["file_path"]
+        
+        return None
+    
+    def _build_method_string(
+        self,
+        namespace: str,
+        query_id: str
+    ) -> Optional[str]:
+        """
+        namespace의 class_name + sql query의 id로 method string 조합
+        
+        Args:
+            namespace: Mapper namespace (예: "com.example.UserMapper")
+            query_id: SQL query의 id (예: "getUserById")
+            
+        Returns:
+            Optional[str]: method string (예: "UserMapper.getUserById")
+        """
+        if not namespace or not query_id:
+            return None
+        
+        # namespace에서 마지막 클래스명 추출
+        class_name = namespace.split('.')[-1]
+        
+        return f"{class_name}.{query_id}"
+    
+    def _find_upper_layer_files(
+        self,
+        method_string: str
+    ) -> List[tuple[str, str]]:
+        """
+        Call Graph에서 method string과 일치하는 부분을 찾아 root까지 상위 layer로 거슬러 올라가면서
+        layer 이름과 file_path가 모두 존재하는 경우를 수집
+        
+        Args:
+            method_string: 메서드 시그니처 (예: "UserMapper.getUserById")
+            
+        Returns:
+            List[tuple[str, str]]: (layer, file_path) 튜플 리스트
+        """
+        result = []
         
         if not self.call_graph_builder or not self.call_graph_builder.call_graph:
-            return dependent_files
+            return result
         
-        # Mapper interface의 클래스명 추출
-        mapper_class_names = set()
-        path_to_file = {str(f.path): f for f in source_files}
-        
-        for file_path_str in mapper_interface_files:
-            if file_path_str not in path_to_file:
-                continue
-            
-            java_file = path_to_file[file_path_str]
-            try:
-                tree, error = self.java_parser.parse_file(java_file.path)
-                if error:
-                    continue
-                
-                classes = self.java_parser.extract_class_info(tree, java_file.path)
-                for cls in classes:
-                    mapper_class_names.add(cls.name)
-                    if cls.package:
-                        mapper_class_names.add(f"{cls.package}.{cls.name}")
-            except Exception as e:
-                self.logger.debug(f"Mapper 클래스명 추출 중 오류 (무시): {file_path_str} - {e}")
-        
-        # Call Graph에서 Mapper interface를 사용하는 메서드 찾기
         call_graph = self.call_graph_builder.call_graph
         method_metadata = self.call_graph_builder.method_metadata
         
-        # Mapper interface의 메서드 시그니처 찾기
-        mapper_methods = set()
-        for method_sig, metadata in method_metadata.items():
-            class_name = metadata.get("class_name", "")
-            if class_name in mapper_class_names:
-                mapper_methods.add(method_sig)
-        
-        # Mapper 메서드를 호출하는 파일 찾기
-        for mapper_method in mapper_methods:
-            # 이 메서드를 호출하는 노드 찾기 (역방향 탐색)
-            if call_graph.has_node(mapper_method):
-                # 이 노드를 호출하는 모든 노드 찾기
-                predecessors = list(call_graph.predecessors(mapper_method))
-                for caller in predecessors:
-                    caller_metadata = method_metadata.get(caller, {})
-                    file_path = caller_metadata.get("file_path", "")
-                    if file_path:
-                        dependent_files.add(file_path)
-        
-        # DAO, Service, Controller 레이어의 파일만 필터링
-        filtered_files = set()
-        for file_path_str in dependent_files:
-            # 파일 경로로 SourceFile 찾기
-            for source_file in source_files:
-                if str(source_file.path) == file_path_str:
-                    # 레이어 확인
-                    layer = self._identify_layer(source_file)
-                    if layer in ["DAO", "Service", "Controller"]:
-                        filtered_files.add(file_path_str)
+        # method_string이 call graph에 있는지 확인
+        if method_string not in call_graph:
+            # 정확히 일치하지 않으면 부분 매칭 시도
+            for node in call_graph.nodes():
+                if method_string in node or node.endswith(f".{method_string.split('.')[-1]}"):
+                    method_string = node
                     break
+            else:
+                return result
         
-        return filtered_files
+        # 역방향으로 탐색 (이 메서드를 호출하는 상위 메서드들)
+        visited = set()
+        
+        def traverse_up(node: str, depth: int = 0, max_depth: int = 20):
+            """역방향으로 탐색하여 root까지 올라가기"""
+            if depth > max_depth or node in visited:
+                return
+            
+            visited.add(node)
+            
+            # 현재 노드의 메타데이터에서 layer와 file_path 추출
+            metadata = method_metadata.get(node, {})
+            layer = self.call_graph_builder._get_layer(node)
+            file_path = metadata.get("file_path", "")
+            
+            # layer와 file_path가 모두 있으면 결과에 추가
+            if layer and file_path and layer != "Unknown":
+                result.append((layer.lower(), file_path))
+            
+            # 이 노드를 호출하는 상위 노드들 찾기 (predecessors)
+            if call_graph.has_node(node):
+                predecessors = list(call_graph.predecessors(node))
+                for predecessor in predecessors:
+                    traverse_up(predecessor, depth + 1, max_depth)
+        
+        # 시작 노드부터 역방향 탐색
+        traverse_up(method_string)
+        
+        return result
     
-    def _assign_file_tags(
+    def _determine_main_layer(
         self,
-        source_files: List[SourceFile],
-        file_table_map: Dict[str, Set[str]]
-    ) -> List[SourceFile]:
-        """
-        각 파일에 접근하는 테이블명을 태그로 부여
-        
-        Args:
-            source_files: 소스 파일 목록
-            file_table_map: 파일-테이블 매핑
-            
-        Returns:
-            List[SourceFile]: 태그가 부여된 소스 파일 목록
-        """
-        tagged_files = []
-        
-        for source_file in source_files:
-            file_path_str = str(source_file.path)
-            tables = file_table_map.get(file_path_str, set())
-            
-            # 태그 생성 (테이블명 리스트)
-            tags = sorted([table for table in tables if table in self.table_column_map])
-            
-            # SourceFile 객체 복사 및 태그 추가
-            tagged_file = SourceFile(
-                path=source_file.path,
-                relative_path=source_file.relative_path,
-                filename=source_file.filename,
-                extension=source_file.extension,
-                size=source_file.size,
-                modified_time=source_file.modified_time,
-                tags=tags
-            )
-            tagged_files.append(tagged_file)
-        
-        return tagged_files
-    
-    def _classify_files_by_layer(
-        self,
-        source_files: List[SourceFile]
-    ) -> Dict[str, List[SourceFile]]:
-        """
-        레이어별 파일 분류
-        
-        Args:
-            source_files: 소스 파일 목록
-            
-        Returns:
-            Dict[str, List[SourceFile]]: 레이어별 파일 목록
-        """
-        layer_files: Dict[str, List[SourceFile]] = defaultdict(list)
-        
-        for source_file in source_files:
-            layer = self._identify_layer(source_file)
-            layer_files[layer].append(source_file)
-        
-        return dict(layer_files)
-    
-    def _identify_layer(self, source_file: SourceFile) -> str:
-        """
-        파일의 레이어 식별
-        
-        Args:
-            source_file: 소스 파일
-            
-        Returns:
-            str: 레이어명 (Mapper, DTO, DAO, Service, Controller, Unknown)
-        """
-        file_path_str = str(source_file.path)
-        filename = source_file.filename
-        
-        # 레이어 패턴 매칭
-        for layer, patterns in self.LAYER_PATTERNS.items():
-            for pattern in patterns:
-                if re.match(pattern, filename, re.IGNORECASE):
-                    return layer
-        
-        # 경로 기반 분류 (확장자도 확인)
-        path_lower = file_path_str.lower()
-        # Mapper 레이어는 .xml 확장자만 허용
-        if (("mapper" in path_lower or "xml" in path_lower) and source_file.extension == ".xml"):
-            return "Mapper"
-        elif "dto" in path_lower and source_file.extension == ".java":
-            return "DTO"
-        elif "dao" in path_lower and source_file.extension == ".java":
-            return "DAO"
-        elif "service" in path_lower and source_file.extension == ".java":
-            return "Service"
-        elif "controller" in path_lower and source_file.extension == ".java":
-            return "Controller"
-        
-        return "Unknown"
-    
-    def _analyze_column_level(
-        self,
-        file_table_map: Dict[str, Set[str]],
-        layer_files: Dict[str, List[SourceFile]]
-    ) -> List[TableAccessInfo]:
-        """
-        칼럼 레벨 분석 및 TableAccessInfo 생성
-        
-        Args:
-            file_table_map: 파일-테이블 매핑
-            layer_files: 레이어별 파일 목록
-            
-        Returns:
-            List[TableAccessInfo]: 테이블 접근 정보 목록
-        """
-        table_access_info_list = []
-        
-        # 테이블별로 그룹화
-        table_file_map: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
-            "files": set(),
-            "columns": set(),
-            "query_types": set(),
-            "sql_queries": []
-        })
-        
-        # XML 파일에서 정보 추출 (확장자가 .xml인 파일만 처리)
-        mapper_files = layer_files.get("Mapper", [])
-        xml_files = [f for f in mapper_files if f.extension == ".xml"]
-        for xml_file in xml_files:
-            try:
-                result = self.xml_parser.parse_mapper_file(xml_file.path)
-                if result.get("error"):
-                    continue
-                
-                for sql_query_info in result.get("sql_queries", []):
-                    sql = sql_query_info.get("sql", "")
-                    query_type = sql_query_info.get("query_type", "")
-                    
-                    if sql:
-                        tables = self.sql_strategy.extract_table_names(sql)
-                        for table in tables:
-                            if table in self.table_column_map:
-                                table_file_map[table]["files"].add(str(xml_file.path))
-                                table_file_map[table]["query_types"].add(query_type)
-                                table_file_map[table]["sql_queries"].append(sql)
-                                
-                                # 칼럼 추출
-                                columns = self.sql_strategy.extract_column_names(sql, table)
-                                table_file_map[table]["columns"].update(columns)
-            except Exception as e:
-                self.logger.warning(f"XML 파일 칼럼 분석 실패: {xml_file.path} - {e}")
-        
-        # Java 파일에서 정보 추출
-        java_files = []
-        for layer in ["DAO", "Service", "Controller"]:
-            java_files.extend(layer_files.get(layer, []))
-        
-        for java_file in java_files:
-            try:
-                sql_queries = self._extract_sql_from_java(java_file.path)
-                for sql in sql_queries:
-                    tables = self.sql_strategy.extract_table_names(sql)
-                    for table in tables:
-                        if table in self.table_column_map:
-                            table_file_map[table]["files"].add(str(java_file.path))
-                            columns = self.sql_strategy.extract_column_names(sql, table)
-                            table_file_map[table]["columns"].update(columns)
-            except Exception as e:
-                self.logger.warning(f"Java 파일 칼럼 분석 실패: {java_file.path} - {e}")
-        
-        # TableAccessInfo 생성
-        for table_name, info in table_file_map.items():
-            # 레이어 결정 (대부분의 파일이 속한 레이어)
-            layer = self._determine_layer_for_table(info["files"], layer_files)
-            
-            # 쿼리 타입 결정
-            query_type = list(info["query_types"])[0] if info["query_types"] else "SELECT"
-            
-            table_access_info = TableAccessInfo(
-                table_name=table_name,
-                columns=sorted(list(info["columns"])),
-                access_files=sorted(list(info["files"])),
-                query_type=query_type,
-                sql_query=info["sql_queries"][0] if info["sql_queries"] else None,
-                layer=layer
-            )
-            table_access_info_list.append(table_access_info)
-        
-        return table_access_info_list
-    
-    def _determine_layer_for_table(
-        self,
-        file_paths: Set[str],
-        layer_files: Dict[str, List[SourceFile]]
+        layer_files: Dict[str, Set[str]]
     ) -> str:
         """
-        테이블 접근 파일들의 레이어 결정
+        주요 레이어 결정 (가장 많은 파일이 있는 레이어)
         
         Args:
-            file_paths: 파일 경로 집합
-            layer_files: 레이어별 파일 목록
+            layer_files: 레이어별 파일 집합
             
         Returns:
-            str: 레이어명
+            str: 주요 레이어명
         """
-        layer_counts = defaultdict(int)
+        if not layer_files:
+            return "Unknown"
         
-        for layer, files in layer_files.items():
-            for file in files:
-                if str(file.path) in file_paths:
-                    layer_counts[layer] += 1
-        
-        if layer_counts:
-            # 가장 많은 파일이 속한 레이어 반환
-            return max(layer_counts.items(), key=lambda x: x[1])[0]
-        
-        return "Unknown"
+        # 파일 수가 가장 많은 레이어
+        max_layer = max(layer_files.items(), key=lambda x: len(x[1]))
+        return max_layer[0].capitalize() if max_layer[0] else "Unknown"
     
-    def _track_dependencies(
+    def _extract_used_columns(
         self,
-        table_access_info_list: List[TableAccessInfo],
-        layer_files: Dict[str, List[SourceFile]]
-    ) -> None:
+        sql_queries: List[Dict[str, Any]],
+        table_name: str,
+        config_columns: Set[str]
+    ) -> Set[str]:
         """
-        테이블 접근 파일 간 의존성 추적
+        SQL 쿼리에서 사용된 칼럼 추출 (설정된 칼럼 중에서만)
         
         Args:
-            table_access_info_list: 테이블 접근 정보 목록
-            layer_files: 레이어별 파일 목록
+            sql_queries: SQL 쿼리 목록
+            table_name: 테이블명
+            config_columns: 설정된 칼럼 목록
+            
+        Returns:
+            Set[str]: 사용된 칼럼 목록
         """
-        if not self.call_graph_builder or not self.call_graph_builder.call_graph:
-            return
+        used_columns = set()
         
-        # Call Graph를 활용하여 의존성 추적
-        for table_info in table_access_info_list:
-            # 각 파일에 대해 상위 레이어 파일 찾기
-            dependent_files = set()
+        for sql_query_info in sql_queries:
+            sql = sql_query_info.get("sql", "")
+            if not sql:
+                continue
             
-            for file_path in table_info.access_files:
-                # Call Graph에서 이 파일을 호출하는 파일 찾기
-                # (간단한 구현, 실제로는 더 복잡한 로직 필요)
-                pass
+            # SQL에서 칼럼 추출
+            sql_columns = self.sql_strategy.extract_column_names(sql, table_name)
+            sql_columns_lower = {c.lower() for c in sql_columns}
             
-            # 의존성 정보를 TableAccessInfo에 추가할 수 있음
-            # (현재 TableAccessInfo 모델에는 의존성 필드가 없으므로 생략)
-
+            # 설정된 칼럼과 교집합
+            used_columns.update(config_columns.intersection(sql_columns_lower))
+        
+        return used_columns
