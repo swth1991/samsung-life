@@ -1,0 +1,138 @@
+@startuml Component Diagram
+!theme plain
+skinparam componentStyle rectangle
+skinparam linetype ortho
+
+title ApplyCrypto 컴포넌트 다이어그램
+
+package "CLI Layer" {
+  component [CLI Controller] as CLI
+}
+
+package "Configuration Layer" {
+  component [Config Manager] as Config
+}
+
+package "Collection Layer" {
+  component [Source File Collector] as Collector
+}
+
+package "Parsing Layer" {
+  component [Java AST Parser] as JavaParser
+  component [XML Mapper Parser] as XMLParser
+  component [Call Graph Builder] as CallGraph
+}
+
+package "Analysis Layer" {
+  component [DB Access Analyzer] as DBAnalyzer
+}
+
+package "Modification Layer" {
+  component [Code Modifier] as CodeModifier
+  component [Batch Processor] as BatchProcessor
+  component [Code Patcher] as CodePatcher
+  component [Error Handler] as ErrorHandler
+  component [Result Tracker] as ResultTracker
+  component [Prompt Template Manager] as TemplateManager
+}
+
+package "LLM Layer" {
+  component [LLM Factory] as LLMFactory
+  component [LLM Provider Interface] as LLMProvider
+  component [WatsonX Provider] as WatsonX
+  component [OpenAI Provider] as OpenAI
+  component [Claude AI Provider] as Claude
+}
+
+package "Persistence Layer" {
+  component [Data Persistence Manager] as Persistence
+  component [Cache Manager] as Cache
+}
+
+package "Models" {
+  component [SourceFile] as SourceFileModel
+  component [TableAccessInfo] as TableAccessModel
+  component [Method] as MethodModel
+  component [CallRelation] as CallRelationModel
+  component [ModificationRecord] as ModRecordModel
+}
+
+' CLI Layer 관계
+CLI --> Config : uses
+CLI --> Collector : uses
+CLI --> JavaParser : uses
+CLI --> XMLParser : uses
+CLI --> CallGraph : uses
+CLI --> DBAnalyzer : uses
+CLI --> CodeModifier : uses
+CLI --> Persistence : uses
+
+' Collection Layer 관계
+Collector --> Config : uses
+Collector --> SourceFileModel : creates
+
+' Parsing Layer 관계
+JavaParser --> Cache : uses
+JavaParser --> MethodModel : creates
+JavaParser --> CallRelationModel : creates
+XMLParser --> TableAccessModel : creates
+CallGraph --> JavaParser : uses
+CallGraph --> Cache : uses
+CallGraph --> MethodModel : uses
+CallGraph --> CallRelationModel : uses
+
+' Analysis Layer 관계
+DBAnalyzer --> Config : uses
+DBAnalyzer --> XMLParser : uses
+DBAnalyzer --> JavaParser : uses
+DBAnalyzer --> CallGraph : uses
+DBAnalyzer --> TableAccessModel : creates
+
+' Modification Layer 관계
+CodeModifier --> Config : uses
+CodeModifier --> LLMFactory : uses
+CodeModifier --> BatchProcessor : uses
+CodeModifier --> CodePatcher : uses
+CodeModifier --> ErrorHandler : uses
+CodeModifier --> ResultTracker : uses
+CodeModifier --> TemplateManager : uses
+CodeModifier --> TableAccessModel : uses
+BatchProcessor --> TemplateManager : uses
+BatchProcessor --> LLMProvider : uses
+CodePatcher --> ErrorHandler : uses
+ResultTracker --> ModRecordModel : creates
+
+' LLM Layer 관계
+LLMFactory --> LLMProvider : creates
+LLMFactory --> WatsonX : creates
+LLMFactory --> OpenAI : creates
+LLMFactory --> Claude : creates
+WatsonX ..|> LLMProvider : implements
+OpenAI ..|> LLMProvider : implements
+Claude ..|> LLMProvider : implements
+
+' Persistence Layer 관계
+Persistence --> Cache : uses
+Persistence --> SourceFileModel : serializes
+Persistence --> TableAccessModel : serializes
+Persistence --> MethodModel : serializes
+Persistence --> CallRelationModel : serializes
+Persistence --> ModRecordModel : serializes
+
+note right of CLI
+  CLI 진입점
+  analyze, list, modify 명령어 처리
+end note
+
+note right of CodeModifier
+  LLM을 활용한
+  코드 자동 수정
+end note
+
+note right of DBAnalyzer
+  DB 접근 패턴 분석
+  Call Graph 역추적
+end note
+
+@enduml
+
