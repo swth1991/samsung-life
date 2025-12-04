@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from tree_sitter import Parser, Language, Node, Tree
 import tree_sitter_java as tsjava
 
-from ..models.method import Method, Parameter
+from ..models.method import Method, Parameter, LocalVariable
 from ..models.call_relation import CallRelation
 from ..persistence.cache_manager import CacheManager
 
@@ -106,7 +106,7 @@ class JavaASTParser:
         """
         import logging
         self.parser = Parser(JAVA_LANGUAGE)
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger("applycrypto")
         # cache_manager가 없으면 임시 디렉터리에 생성
         if cache_manager is None:
             from tempfile import mkdtemp
@@ -442,9 +442,10 @@ class JavaASTParser:
             if child.type == "formal_parameters":
                 method.parameters = self._extract_parameters(child)
         
-        # 메서드 호출 추출
+        # 메서드 블록에서 지역 변수 및 메서드 호출 추출
         for child in node.children:
             if child.type == "block":
+                method.local_variables = self._extract_local_variables(child)
                 method.method_calls = self._extract_method_calls(child)
         
         return method if method.name else None
@@ -477,6 +478,48 @@ class JavaASTParser:
                     params.append(param)
         
         return params
+    
+    def _extract_local_variables(self, node: Node) -> List[LocalVariable]:
+        """
+        메서드 블록 내 지역 변수 추출
+        
+        Args:
+            node: block 노드 (메서드 블록)
+            
+        Returns:
+            List[LocalVariable]: 지역 변수 목록
+        """
+        local_vars = []
+        
+        # block 내부의 모든 노드를 재귀적으로 탐색
+        for child in self._traverse_tree(node):
+            if child.type == "local_variable_declaration":
+                # 지역 변수 선언 노드 처리
+                var_type = ""
+                var_names = []
+                
+                # 타입 추출
+                for subchild in child.children:
+                    if subchild.type in ["type_identifier", "generic_type", "integral_type", 
+                                        "floating_point_type", "boolean_type", "void_type"]:
+                        var_type = subchild.text.decode('utf8')
+                        break
+                
+                # 변수명 추출 (variable_declarator)
+                for subchild in child.children:
+                    if subchild.type == "variable_declarator":
+                        for var_child in subchild.children:
+                            if var_child.type == "identifier":
+                                var_name = var_child.text.decode('utf8')
+                                if var_name:
+                                    var_names.append(var_name)
+                
+                # 각 변수명에 대해 LocalVariable 생성
+                for var_name in var_names:
+                    if var_type:  # 타입이 있는 경우만 추가
+                        local_vars.append(LocalVariable(name=var_name, type=var_type))
+        
+        return local_vars
     
     def _extract_method_calls(self, node: Node) -> List[str]:
         """

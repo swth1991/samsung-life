@@ -24,6 +24,19 @@ class Parameter:
 
 
 @dataclass
+class LocalVariable:
+    """
+    메서드 내부 지역 변수 정보
+    
+    Attributes:
+        name: 변수 이름
+        type: 변수 타입
+    """
+    name: str
+    type: str
+
+
+@dataclass
 class Method:
     """
     Java 메서드 정보를 저장하는 데이터 모델
@@ -32,6 +45,7 @@ class Method:
         name: 메서드명
         return_type: 반환 타입
         parameters: 파라미터 목록
+        local_variables: 메서드 내부 지역 변수 목록
         access_modifier: 접근 제어자 (public, private, protected, package)
         class_name: 소속 클래스명
         file_path: 파일 경로
@@ -43,6 +57,7 @@ class Method:
     name: str
     return_type: str
     parameters: List[Parameter]
+    local_variables: List[LocalVariable] = field(default_factory=list)
     access_modifier: str = "package"
     class_name: Optional[str] = None
     file_path: str = ""
@@ -65,6 +80,13 @@ class Method:
                     "is_varargs": p.is_varargs
                 }
                 for p in self.parameters
+            ],
+            "local_variables": [
+                {
+                    "name": v.name,
+                    "type": v.type
+                }
+                for v in self.local_variables
             ],
             "access_modifier": self.access_modifier,
             "class_name": self.class_name,
@@ -90,6 +112,13 @@ class Method:
                     is_varargs=p.get("is_varargs", False)
                 )
                 for p in data.get("parameters", [])
+            ],
+            local_variables=[
+                LocalVariable(
+                    name=v["name"],
+                    type=v["type"]
+                )
+                for v in data.get("local_variables", [])
             ],
             access_modifier=data.get("access_modifier", "package"),
             class_name=data.get("class_name"),

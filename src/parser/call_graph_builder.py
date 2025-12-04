@@ -138,7 +138,7 @@ class CallGraphBuilder:
         else:
             self.java_parser = java_parser
         
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger("applycrypto")
         
         # Call Graph (networkx DiGraph)
         self.call_graph: Optional[nx.DiGraph] = None
@@ -220,9 +220,32 @@ class CallGraphBuilder:
                     "annotations": method.annotations,
                     "layer": self._classify_layer(cls, method)
                 }
-                
+
                 # 현재 클래스의 필드 정보 가져오기
                 current_field_map = class_field_map.get(cls.name, {})
+                
+                # 메서드의 parameters와 local_variables를 가져와서 method_variable_map 구성
+                method_variable_map: Dict[str, str] = {}  # 변수명 -> 타입
+                
+                # 메서드의 parameter들의 type 처리
+                for param in method.parameters:
+                    param_name = param.name
+                    param_type = param.type
+                    if param_name and param_type:
+                        # 제네릭 타입 처리 (예: List<User> -> List)
+                        if '<' in param_type:
+                            param_type = param_type.split('<')[0]
+                        method_variable_map[param_name] = param_type
+                
+                # 메서드의 local_variables들의 type 처리
+                for local_var in method.local_variables:
+                    var_name = local_var.name
+                    var_type = local_var.type
+                    if var_name and var_type:
+                        # 제네릭 타입 처리 (예: List<User> -> List)
+                        if '<' in var_type:
+                            var_type = var_type.split('<')[0]
+                        method_variable_map[var_name] = var_type
                 
                 # 메서드 호출 관계 추출
                 for call in method.method_calls:
@@ -237,6 +260,7 @@ class CallGraphBuilder:
                             object_name = parts[0]  # 필드명 또는 변수명
                             callee_method = parts[-1]
                             
+                        
                             # 필드 변수를 통한 호출인지 확인
                             if object_name in current_field_map:
                                 # 필드 타입 찾기
@@ -250,9 +274,24 @@ class CallGraphBuilder:
                                 else:
                                     # 필드 타입 클래스를 찾을 수 없는 경우 필드 타입으로 매핑 시도
                                     callee_signature = f"{field_type}.{callee_method}"
+                            elif object_name in method_variable_map:
+                                # 메서드 변수(파라미터 또는 리턴 타입)를 통한 호출인지 확인
+                                variable_type = method_variable_map[object_name]
+                                
+                                # 변수 타입이 다른 클래스인 경우 해당 클래스의 메서드로 매핑
+                                if variable_type in self.class_info_map:
+                                    callee_signature = f"{variable_type}.{callee_method}"
+                                    callee_cls = self.class_info_map[variable_type]
+                                    callee_file = callee_cls.file_path
+                                else:
+                                    # 변수 타입 클래스를 찾을 수 없는 경우 변수 타입으로 매핑 시도
+                                    callee_signature = f"{variable_type}.{callee_method}"
                             else:
                                 # 필드가 아니거나 찾을 수 없는 경우 같은 클래스 내 메서드로 간주
-                                callee_signature = f"{cls.name}.{callee_method}"
+                                # callee_signature = f"{cls.name}.{callee_method}"
+                                # 현재 클래스로 대체하지 말고 변수 이름을 signature에 남겨두자.
+                                callee_signature = call
+
                         else:
                             callee_signature = f"{cls.name}.{call}"
                     else:
