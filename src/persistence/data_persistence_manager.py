@@ -44,7 +44,7 @@ class DataPersistenceManager:
     
     def __init__(
         self,
-        project_path: Path,
+        target_project: Path,
         output_dir: Optional[Path] = None,
         enable_cache: bool = True
     ):
@@ -56,14 +56,15 @@ class DataPersistenceManager:
             output_dir: 결과 저장 디렉터리 (None이면 현재 작업 디렉터리/.applycrypto/results 사용)
             enable_cache: 캐싱 활성화 여부
         """
-        self.project_path = Path(project_path)
-        # output_dir이 지정되지 않으면 현재 작업 디렉터리 아래에 생성
-        if output_dir is None:
-            from pathlib import Path as PathLib
-            current_dir = PathLib.cwd()
-            self.output_dir = current_dir / ".applycrypto" / "results"
-        else:
-            self.output_dir = Path(output_dir)
+        self.target_project = Path(target_project)
+        self.output_dir = self.target_project / ".applycrypto" / "results"
+        # # output_dir이 지정되지 않으면 현재 작업 디렉터리 아래에 생성
+        # if output_dir is None:
+        #     from pathlib import Path as PathLib
+        #     current_dir = PathLib.cwd()
+        #     self.output_dir = current_dir / ".applycrypto" / "results"
+        # else:
+        #     self.output_dir = Path(output_dir)
         self.logger = logging.getLogger(__name__)
         
         # 결과 디렉터리 생성

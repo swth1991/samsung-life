@@ -6,6 +6,7 @@ REST API 엔드포인트부터 DAO/Mapper까지 이어지는 호출 체인을 �
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import List, Dict, Optional, Set, Tuple, Any
 from collections import defaultdict, deque
@@ -419,6 +420,134 @@ class CallGraphBuilder:
         
         return 'Unknown'
     
+    def _extract_path_from_annotation(self, annotation: str) -> Optional[str]:
+        """
+        어노테이션 문자열에서 path(value 또는 path 속성) 추출
+        
+        Args:
+            annotation: 어노테이션 문자열 (예: "@GetMapping(\"/users\")" 또는 "@RequestMapping(value=\"/api\")")
+            
+        Returns:
+            Optional[str]: 추출된 path 또는 None
+        """
+        if not annotation:
+            return None
+        
+        # 어노테이션 전체 텍스트를 가져오기 위해 AST에서 직접 추출 시도
+        # 하지만 현재는 문자열만 있으므로 정규표현식으로 파싱
+        
+        # 패턴 1: @GetMapping("/path") 또는 @GetMapping(value="/path")
+        # 패턴 2: @RequestMapping(value="/path") 또는 @RequestMapping(path="/path")
+        # 패턴 3: @GetMapping() - path 없음
+        
+        # value="/path" 또는 path="/path" 또는 "/path" 형식 추출
+        patterns = [
+            r'value\s*=\s*["\']([^"\']+)["\']',  # value="/path"
+            r'path\s*=\s*["\']([^"\']+)["\']',   # path="/path"
+            r'\(\s*["\']([^"\']+)["\']\s*\)',    # ("/path")
+            r'\(\s*["\']([^"\']+)["\']',          # ("/path" (닫는 괄호 없을 수도)
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, annotation)
+            if match:
+                path = match.group(1)
+                if path:
+                    return path
+        
+        return None
+    
+    def _extract_http_method_from_annotation(self, annotation: str) -> Optional[str]:
+        """
+        어노테이션에서 HTTP 메서드 추출
+        
+        Args:
+            annotation: 어노테이션 문자열
+            
+        Returns:
+            Optional[str]: HTTP 메서드 (GET, POST, PUT, DELETE, PATCH) 또는 None
+        """
+        if 'GetMapping' in annotation:
+            return 'GET'
+        elif 'PostMapping' in annotation:
+            return 'POST'
+        elif 'PutMapping' in annotation:
+            return 'PUT'
+        elif 'DeleteMapping' in annotation:
+            return 'DELETE'
+        elif 'PatchMapping' in annotation:
+            return 'PATCH'
+        elif 'RequestMapping' in annotation:
+            # @RequestMapping(method = RequestMethod.GET) 형식 처리
+            method_match = re.search(r'method\s*=\s*RequestMethod\.(\w+)', annotation, re.IGNORECASE)
+            if method_match:
+                return method_match.group(1).upper()
+            # 기본값은 GET
+            return 'GET'
+        
+        return None
+    
+    def _get_annotation_text_from_file(self, file_path: str, target_name: str, is_class: bool = True) -> Dict[str, str]:
+        """
+        파일에서 어노테이션 전체 텍스트 추출
+        
+        Args:
+            file_path: 파일 경로
+            target_name: 클래스명 또는 메서드명
+            is_class: True면 클래스, False면 메서드
+            
+        Returns:
+            Dict[str, str]: 어노테이션 이름 -> 전체 텍스트 매핑
+        """
+        annotation_map = {}
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                source_code = f.read()
+        except Exception:
+            try:
+                with open(file_path, 'r', encoding='euc-kr') as f:
+                    source_code = f.read()
+            except Exception:
+                return annotation_map
+        
+        if is_class:
+            # 클래스 어노테이션 추출
+            # class ClassName 또는 public class ClassName 앞의 어노테이션들 찾기
+            pattern = rf'(?:@\w+(?:\([^)]*\))?\s*)+class\s+{re.escape(target_name)}\b'
+            match = re.search(pattern, source_code, re.MULTILINE | re.DOTALL)
+            if match:
+                # 매칭된 부분에서 어노테이션 추출
+                matched_text = source_code[:match.end()]
+                # class 키워드 이전 부분
+                before_class = matched_text[:matched_text.rfind('class')]
+                # 어노테이션 패턴 찾기
+                annotation_pattern = r'@(\w+)(\([^)]*\))?'
+                for ann_match in re.finditer(annotation_pattern, before_class):
+                    ann_name = ann_match.group(1)
+                    ann_full = ann_match.group(0)
+                    annotation_map[ann_name] = ann_full
+        else:
+            # 메서드 어노테이션 추출
+            # 메서드 시그니처 앞의 어노테이션들 찾기
+            # @GetMapping(...) public ReturnType methodName(...) 패턴
+            pattern = rf'(?:@\w+(?:\([^)]*\))?\s*)+(?:public\s+|private\s+|protected\s+)?(?:static\s+)?(?:final\s+)?\w+\s+{re.escape(target_name)}\s*\('
+            match = re.search(pattern, source_code, re.MULTILINE | re.DOTALL)
+            if match:
+                # 매칭된 부분에서 어노테이션 추출
+                matched_text = source_code[:match.end()]
+                # 메서드명 이전 부분
+                method_name_pos = matched_text.rfind(target_name)
+                before_method = matched_text[:method_name_pos]
+                # 어노테이션 패턴 찾기
+                annotation_pattern = r'@(\w+)(\([^)]*\))?'
+                for ann_match in re.finditer(annotation_pattern, before_method):
+                    ann_name = ann_match.group(1)
+                    ann_full = ann_match.group(0)
+                    annotation_map[ann_name] = ann_full
+        
+        return annotation_map
+    
     def _identify_endpoints(self, classes: List[ClassInfo]) -> None:
         """
         REST API 엔드포인트 식별
@@ -431,11 +560,17 @@ class CallGraphBuilder:
         for cls in classes:
             # 클래스 레벨 경로 추출
             class_path = ""
-            for annotation in cls.annotations:
-                if 'RequestMapping' in annotation:
-                    # @RequestMapping(value="/api/users") 형식 처리
-                    # 실제로는 더 정교한 파싱이 필요하지만, 간단히 처리
-                    class_path = "/api"  # 기본값
+            # 파일에서 클래스 어노테이션 전체 텍스트 가져오기
+            class_annotations = self._get_annotation_text_from_file(cls.file_path, cls.name, is_class=True)
+            
+            for annotation_name in cls.annotations:
+                if 'RequestMapping' in annotation_name:
+                    # 파일에서 실제 어노테이션 텍스트 가져오기
+                    full_annotation = class_annotations.get(annotation_name, annotation_name)
+                    extracted_path = self._extract_path_from_annotation(full_annotation)
+                    if extracted_path:
+                        class_path = extracted_path
+                    break
             
             # 메서드 레벨 엔드포인트 식별
             for method in cls.methods:
@@ -463,28 +598,41 @@ class CallGraphBuilder:
         http_method = None
         method_path = ""
         
+        # 파일에서 메서드 어노테이션 전체 텍스트 가져오기
+        method_annotations = self._get_annotation_text_from_file(cls.file_path, method.name, is_class=False)
+        
         # 메서드 어노테이션 확인
-        for annotation in method.annotations:
-            if 'GetMapping' in annotation:
-                http_method = 'GET'
-                # 실제로는 어노테이션 속성에서 경로 추출해야 함
-                method_path = "/{id}"  # 기본값
-            elif 'PostMapping' in annotation:
-                http_method = 'POST'
-                method_path = ""
-            elif 'PutMapping' in annotation:
-                http_method = 'PUT'
-                method_path = "/{id}"
-            elif 'DeleteMapping' in annotation:
-                http_method = 'DELETE'
-                method_path = "/{id}"
-            elif 'RequestMapping' in annotation:
-                # @RequestMapping(method = RequestMethod.GET, value = "/path")
-                http_method = 'GET'  # 기본값
-                method_path = ""
+        for annotation_name in method.annotations:
+            # 파일에서 실제 어노테이션 텍스트 가져오기
+            full_annotation = method_annotations.get(annotation_name, annotation_name)
+            
+            # HTTP 메서드 추출
+            extracted_method = self._extract_http_method_from_annotation(full_annotation)
+            if extracted_method:
+                http_method = extracted_method
+                # path 추출
+                extracted_path = self._extract_path_from_annotation(full_annotation)
+                if extracted_path:
+                    method_path = extracted_path
+                break  # 첫 번째 매칭되는 어노테이션 사용
         
         if http_method:
-            full_path = class_path + method_path
+            # class_path와 method_path 결합
+            if class_path and method_path:
+                # 둘 다 슬래시로 시작하면 하나 제거
+                if class_path.endswith('/') and method_path.startswith('/'):
+                    full_path = class_path + method_path[1:]
+                elif not class_path.endswith('/') and not method_path.startswith('/'):
+                    full_path = class_path + '/' + method_path
+                else:
+                    full_path = class_path + method_path
+            elif class_path:
+                full_path = class_path
+            elif method_path:
+                full_path = method_path
+            else:
+                full_path = ""
+            
             method_signature = f"{cls.name}.{method.name}"
             
             return Endpoint(

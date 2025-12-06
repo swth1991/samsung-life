@@ -534,58 +534,134 @@ class JavaASTParser:
         calls = []
         
         if node.type == "method_invocation":
-            method_name = None
-            object_name = None
+            # 여러 개의 '.'이나 '::'로 연결된 경우를 처리
+            # 마지막 '.'이나 '::'를 기준으로 method 호출 추출
+            # 예: this.vets.findAll() -> vets.findAll()
             
-            # method_invocation의 자식 구조 분석
-            # userService.findById(1) 같은 경우:
-            # [0] identifier: userService
-            # [1] .: .
-            # [2] identifier: findById
-            # [3] argument_list: (1)
-            children = list(node.children)
-            
-            # 첫 번째 identifier가 있고, 그 다음이 '.'이면 객체.메서드 형식
-            if len(children) >= 3 and children[0].type == "identifier" and children[1].type == ".":
-                object_name = children[0].text.decode('utf8')
-                if children[2].type == "identifier":
-                    method_name = children[2].text.decode('utf8')
-            # field_access 노드가 있는 경우 (다른 형식)
-            elif any(child.type == "field_access" for child in children):
-                for child in children:
-                    if child.type == "field_access":
-                        # field_access 내부 구조 분석
-                        field_children = list(child.children)
-                        if len(field_children) >= 2:
-                            # object.field 형식
-                            if field_children[0].type == "identifier":
-                                object_name = field_children[0].text.decode('utf8')
-                            if field_children[-1].type == "identifier":
-                                method_name = field_children[-1].text.decode('utf8')
-            # 단순 identifier만 있는 경우 (같은 클래스 내 메서드 호출)
-            elif len(children) > 0 and children[0].type == "identifier":
-                # argument_list 전의 identifier가 메서드명
-                for child in children:
-                    if child.type == "identifier":
-                        method_name = child.text.decode('utf8')
+            def extract_method_call_from_node(method_node: Node) -> Optional[str]:
+                """method_invocation 노드에서 메서드 호출 문자열 추출 (재귀적)"""
+                method_children = list(method_node.children)
+                
+                # argument_list 찾기 (메서드명은 argument_list 바로 앞)
+                method_name = None
+                argument_list_idx = -1
+                for i, child in enumerate(method_children):
+                    if child.type == "argument_list":
+                        argument_list_idx = i
+                        # argument_list 바로 앞의 identifier가 메서드명
+                        if i > 0 and method_children[i - 1].type == "identifier":
+                            method_name = method_children[i - 1].text.decode('utf8')
+                            if method_name == "vetToVetDto":
+                                print(method_name)
                         break
-            # object_creation인 경우
-            elif any(child.type == "object_creation" for child in children):
-                for child in children:
-                    if child.type == "object_creation":
-                        for subchild in child.children:
-                            if subchild.type == "type_identifier":
-                                object_name = subchild.text.decode('utf8')
-                        # object_creation 다음의 identifier가 메서드명
-                        idx = children.index(child)
-                        if idx + 1 < len(children) and children[idx + 1].type == "identifier":
-                            method_name = children[idx + 1].text.decode('utf8')
-            
-            if method_name:
-                if object_name:
-                    calls.append(f"{object_name}.{method_name}")
+                
+                # argument_list가 없는 경우 (예: this.vets.findAll()에서 this 부분)
+                # 중첩된 method_invocation이 있으면 그 결과를 반환
+                if not method_name:
+                    for child in method_children:
+                        if child.type == "method_invocation":
+                            # 중첩된 method_invocation의 결과를 그대로 반환
+                            nested_result = extract_method_call_from_node(child)
+                            if nested_result:
+                                return nested_result
+                    return None
+                
+                # argument_list 이전의 부분에서 object 부분 추출
+                # 여러 개의 '.'이나 '::'로 연결된 경우 처리
+                parts = []
+                separator = None
+                
+                # argument_list 이전의 children만 처리
+                for i in range(argument_list_idx):
+                    child = method_children[i]
+                    
+                    if child.type == "identifier":
+                        identifier_text = child.text.decode('utf8')
+                        # this는 제외
+                        if identifier_text != "this":
+                            parts.append(identifier_text)
+                            if identifier_text == "vetToVetDto":
+                                print(method_name)
+                    elif child.type == "field_access":
+                        # field_access 내부를 재귀적으로 처리
+                        field_result = extract_from_field_access(child)
+                        if field_result:
+                            parts.append(field_result)
+                    elif child.type == "method_invocation":
+                        # 중첩된 method_invocation (예: this.vets.findAll())
+                        # 재귀적으로 처리하되, 전체 체인을 parts에 추가
+                        # 예: this.vets.findAll() -> vets.findAll()이 nested_result
+                        # 하지만 여기서는 vets만 parts에 추가해야 함
+                        nested_result = extract_method_call_from_node(child)
+                        if nested_result:
+                            # nested_result는 "object.method" 형식
+                            # 마지막 '.' 또는 '::'를 기준으로 object 부분만 추출
+                            if '.' in nested_result:
+                                object_part = nested_result.rsplit('.', 1)[0]
+                                if object_part:
+                                    parts.append(object_part)
+                            elif '::' in nested_result:
+                                object_part = nested_result.rsplit('::', 1)[0]
+                                if object_part:
+                                    parts.append(object_part)
+                            # method만 있는 경우는 parts에 추가하지 않음
+                    elif child.type == ".":
+                        separator = "."
+                    elif child.type == "::":
+                        separator = "::"
+                
+                # 마지막 '.' 또는 '::'를 기준으로 object.method 추출
+                if len(parts) >= 2:
+                    # 마지막 두 요소를 사용: parts[-2]는 object, parts[-1]은 무시 (이미 method_name에 있음)
+                    # 실제로는 parts의 마지막 전까지가 object
+                    object_parts = parts[:-1] if len(parts) > 1 else []
+                    if object_parts:
+                        object_name = separator.join(object_parts) if separator else object_parts[0]
+                        return f"{object_name}{separator or '.'}{method_name}"
+                    else:
+                        return method_name
+                elif len(parts) == 1:
+                    # parts[0]가 method_name과 같으면 단순 메서드 호출 (예: myfunc())
+                    # parts[0]가 method_name과 다르면 object.method 형식 (예: obj.method())
+                    if parts[0] == method_name:
+                        # method() 형식
+                        return method_name
+                    else:
+                        # object.method 형식
+                        return f"{parts[0]}{separator or '.'}{method_name}"
                 else:
-                    calls.append(method_name)
+                    # method() 형식 (parts가 비어있고 method_name만 있는 경우)
+                    return method_name
+            
+            def extract_from_field_access(field_node: Node) -> Optional[str]:
+                """field_access 노드에서 필드 접근 문자열 추출 (재귀적)"""
+                field_children = list(field_node.children)
+                parts = []
+                separator = None
+                
+                for child in field_children:
+                    if child.type == "identifier":
+                        identifier_text = child.text.decode('utf8')
+                        if identifier_text != "this":
+                            parts.append(identifier_text)
+                    elif child.type == "field_access":
+                        # 중첩된 field_access
+                        nested_result = extract_from_field_access(child)
+                        if nested_result:
+                            parts.append(nested_result)
+                    elif child.type == ".":
+                        separator = "."
+                    elif child.type == "::":
+                        separator = "::"
+                
+                if parts:
+                    return separator.join(parts) if separator and len(parts) > 1 else parts[0]
+                return None
+            
+            # method_invocation에서 메서드 호출 추출
+            method_call = extract_method_call_from_node(node)
+            if method_call:
+                calls.append(method_call)
         
         for child in node.children:
             calls.extend(self._extract_method_calls(child))
@@ -605,34 +681,6 @@ class JavaASTParser:
         yield node
         for child in node.children:
             yield from self._traverse_tree(child)
-    
-    def build_call_graph(
-        self, 
-        classes: List[ClassInfo]
-    ) -> Dict[str, List[str]]:
-        """
-        Call Graph 생성
-        
-        Args:
-            classes: 클래스 정보 목록
-            
-        Returns:
-            Dict[str, List[str]]: Call Graph (caller -> [callees])
-        """
-        call_graph = defaultdict(list)
-        
-        for cls in classes:
-            for method in cls.methods:
-                caller = f"{cls.name}.{method.name}"
-                for call in method.method_calls:
-                    # call 형식이 "object.method"인 경우 callee는 "method"만 사용
-                    if '.' in call:
-                        callee = call.split('.')[-1]
-                    else:
-                        callee = call
-                    call_graph[caller].append(callee)
-        
-        return dict(call_graph)
     
     def extract_call_relations(
         self, 
